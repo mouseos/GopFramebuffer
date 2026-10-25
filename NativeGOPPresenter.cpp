@@ -31,6 +31,7 @@ class NativeGOPPresenter : public IOService {
     IOMemoryMap *mapping=nullptr;
     IOLock *gate=nullptr;
     IOService *owner=nullptr;
+    IOService *handoffOwner=nullptr;   // borrowed while this connection holds the presenter's exclusive open
     NGPMode mode={};
     bool online=false;
     IOService *memorySource=nullptr;
@@ -39,12 +40,14 @@ class NativeGOPPresenter : public IOService {
     struct {bool offered,delivered;uint64_t sequence;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
             uint64_t stride;uint32_t width,height;} swap={};
     uint64_t swapSequence=0;
-    IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *);
-    IOReturn completeSwap(uint64_t sequence,int status);
-    void abandonSwap();
+    IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *,IOService *client=nullptr);
+    IOReturn completeSwap(uint64_t sequence,int status,IOService *client=nullptr);
+    bool abandonSwap(IOService *client=nullptr);
 public:
     void setMemorySource(IOService *source) {memorySource=source;}
-    static IOReturn handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize);
+    static IOReturn handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize,IOService *client=nullptr);
+    static IOReturn handoffAcquire(IOService *client);
+    static void handoffClose(IOService *client);
     static IOMemoryDescriptor *handoffMemory();
     bool offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
 private:
@@ -140,15 +143,16 @@ bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t
     }
     IOLockUnlock(gate);return accepted;
 }
-IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *out) {
+IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *out,IOService *client) {
     if(!gpuMode)return kIOReturnUnsupported;
     if(timeoutMs>1000)timeoutMs=1000;
     uint64_t deadline;clock_interval_to_deadline((uint32_t)timeoutMs,kMillisecondScale,&deadline);
     const uint64_t began=mach_absolute_time();
     native_gop_wait_stats[0]=native_gop_wait_stats[0]+1;native_gop_wait_stats[2]=timeoutMs;
     IOLockLock(gate);
+    if(handoffOwner!=client) {IOLockUnlock(gate);return kIOReturnNotOpen;}
     gpuClient=true;
-    while(online && (!swap.offered || swap.delivered)) {
+    while(online && handoffOwner==client && (!swap.offered || swap.delivered)) {
         if(IOLockSleepDeadline(gate,&swap,deadline,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
             IOLockUnlock(gate);
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-began,&ns);
@@ -159,7 +163,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
             return kIOReturnTimeout;
         }
     }
-    if(!online) {IOLockUnlock(gate);return kIOReturnNotReady;}
+    if(!online || handoffOwner!=client) {IOLockUnlock(gate);return kIOReturnNotReady;}
     swap.delivered=true;
     IOMemoryDescriptor *memory=swap.memory;memory->retain();
     const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
@@ -168,7 +172,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
     memory->release();
     IOLockLock(gate);
-    if(!map || !map->getVirtualAddress() || !swap.offered || swap.sequence!=sequence) {
+    if(!map || !map->getVirtualAddress() || handoffOwner!=client || !swap.offered || swap.sequence!=sequence) {
         IOLockUnlock(gate);OSSafeReleaseNULL(map);__atomic_fetch_add(&native_gop_gpu_failures,1,__ATOMIC_RELAXED);return kIOReturnNoMemory;
     }
     swap.map=map;
@@ -176,8 +180,9 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=0;
     IOLockUnlock(gate);return kIOReturnSuccess;
 }
-IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
+IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status,IOService *client) {
     IOLockLock(gate);
+    if(handoffOwner!=client) {IOLockUnlock(gate);return kIOReturnNotOpen;}
     if(!swap.offered || !swap.delivered || swap.sequence!=sequence) {IOLockUnlock(gate);return kIOReturnBadArgument;}
     auto done=swap;swap={};
     IOLockUnlock(gate);
@@ -187,16 +192,20 @@ IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
     native_legacy_gpu_complete(done.display,status);return kIOReturnSuccess;
 }
 // The client went away with a frame outstanding: the display driver is told it failed, so it can use its own path instead of waiting forever.
-void NativeGOPPresenter::abandonSwap() {
-    if(!gate)return;
+bool NativeGOPPresenter::abandonSwap(IOService *client) {
+    if(!gate)return false;
     IOLockLock(gate);
+    if(client && handoffOwner!=client) {IOLockUnlock(gate);return false;}
+    handoffOwner=nullptr;
     gpuClient=false;
     auto done=swap;swap={};
+    IOLockWakeup(gate,&swap,false);   // a WAIT_SWAP on the closed session must not consume the next owner's frame
     IOLockUnlock(gate);
-    if(!done.offered)return;
+    if(!done.offered)return true;
     OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
     __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
     native_legacy_gpu_complete(done.display,kIOReturnAborted);
+    return true;
 }
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub) {
     if(NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter))p->setMemorySource(nub);
@@ -208,9 +217,13 @@ extern "C" bool native_gop_gpu_offer(IOService *presenter,void *display,IOMemory
 // Entry points for the GPU client that reaches the hand-off through an already admitted connection (the Adreno accelerator's user client, which
 // the original sandbox profiles allow where they do not allow this service): op 0 mode, 2 wait for a frame, 3 complete it (the NGP_METHOD_*
 // numbers). Same checks as the service's own methods; sizes are the wire records'.
-IOReturn NativeGOPPresenter::handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize) {
+IOReturn NativeGOPPresenter::handoffCall(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize,IOService *client) {
     NativeGOPPresenter *p=gHandoff;
     if(!p || !p->gpuMode || !p->online)return kIOReturnNotReady;
+    IOLockLock(p->gate);
+    const bool admitted=p->handoffOwner==client;
+    IOLockUnlock(p->gate);
+    if(!admitted)return kIOReturnNotOpen;
     switch(op) {
     case NGP_METHOD_MODE:
         if(inSize || !out || outSize!=sizeof(NGPMode))return kIOReturnBadArgument;
@@ -218,16 +231,34 @@ IOReturn NativeGOPPresenter::handoffCall(uint32_t op,task_t task,const void *in,
     case NGP_METHOD_WAIT_SWAP: {
         if(!in || inSize!=sizeof(NGPWait) || !out || outSize!=sizeof(NGPSwap))return kIOReturnBadArgument;
         NGPWait q={};NGPSwap swap={};memcpy(&q,in,sizeof(q));
-        IOReturn status=p->waitSwap(task,q.timeout_ms,&swap);
-        if(status==kIOReturnSuccess)memcpy(out,&swap,sizeof(swap));return status;
+        IOReturn status=p->waitSwap(task,q.timeout_ms,&swap,client);
+        if(status==kIOReturnSuccess)memcpy(out,&swap,sizeof(swap));
+        return status;
     }
     case NGP_METHOD_COMPLETE_SWAP: {
         if(!in || inSize!=sizeof(NGPComplete) || outSize)return kIOReturnBadArgument;
         NGPComplete q={};memcpy(&q,in,sizeof(q));
-        return p->completeSwap(q.sequence,(int)q.status);
+        return p->completeSwap(q.sequence,(int)q.status,client);
     }
     default:return kIOReturnUnsupported;
     }
+}
+// Owned tunnel sessions use the same exclusive IOService open as NativeGOPClient. The old Adreno entry point remains
+// available only while no owned session is active. The token is the live IOUserClient object, never a caller's task pointer.
+IOReturn NativeGOPPresenter::handoffAcquire(IOService *client) {
+    NativeGOPPresenter *p=gHandoff;
+    if(!client || !p || !p->gpuMode || !p->online)return kIOReturnNotReady;
+    if(!p->open(client))return kIOReturnExclusiveAccess;
+    IOLockLock(p->gate);
+    const bool admitted=p->online && !p->gpuClient && !p->handoffOwner;
+    if(admitted)p->handoffOwner=client;
+    IOLockUnlock(p->gate);
+    if(!admitted)p->close(client);
+    return admitted?kIOReturnSuccess:kIOReturnExclusiveAccess;
+}
+void NativeGOPPresenter::handoffClose(IOService *client) {
+    NativeGOPPresenter *p=gHandoff;
+    if(p && client && p->abandonSwap(client))p->close(client);
 }
 // The scanout as a writable, retained descriptor (GPU mode only); the caller maps it into its task.
 IOMemoryDescriptor *NativeGOPPresenter::handoffMemory() {
@@ -239,6 +270,12 @@ IOMemoryDescriptor *NativeGOPPresenter::handoffMemory() {
 }
 extern "C" IOReturn native_gop_handoff_call(uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize) {
     return NativeGOPPresenter::handoffCall(op,task,in,inSize,out,outSize);
+}
+extern "C" IOReturn native_gop_handoff_acquire(IOService *owner) {return NativeGOPPresenter::handoffAcquire(owner);}
+extern "C" void native_gop_handoff_close(IOService *owner) {NativeGOPPresenter::handoffClose(owner);}
+extern "C" IOReturn native_gop_handoff_call_owned(IOService *owner,uint32_t op,task_t task,const void *in,size_t inSize,void *out,size_t outSize) {
+    if(!owner)return kIOReturnBadArgument;
+    return NativeGOPPresenter::handoffCall(op,task,in,inSize,out,outSize,owner);
 }
 extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void) {return NativeGOPPresenter::handoffMemory();}
 IOReturn NativeGOPPresenter::newUserClient(task_t task,void *security,UInt32 type,OSDictionary *properties,IOUserClient **out) {
