@@ -22,6 +22,18 @@ void native_gop_presenter_set_source(IOService *presenter,IOService *nub);
 // Provided by the display driver: finishes (status 0) or fails the swap that was offered.
 void native_legacy_gpu_complete(void *display,int status);
 }
+// Observer must be resident for the kernel lifetime. Called under the handoff gate:
+// fixed POD recording only, no allocation, logging, VM lookup or blocking locks.
+using NativeGOPLatencyObserver=void (*)(uint32_t,uint64_t,uint64_t);
+static NativeGOPLatencyObserver gLatencyObserver;
+extern "C" void native_gop_set_latency_observer(NativeGOPLatencyObserver observer) {
+    NativeGOPLatencyObserver expected=nullptr;
+    (void)__atomic_compare_exchange_n(&gLatencyObserver,&expected,observer,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
+}
+static void latencyEvent(uint32_t kind,uint64_t sequence) {
+    auto observer=__atomic_load_n(&gLatencyObserver,__ATOMIC_ACQUIRE);
+    if(observer)observer(kind,sequence,mach_absolute_time());
+}
 class NativeGOPClient;
 class NativeGOPPresenter;
 static NativeGOPPresenter *gHandoff;   // the presenter in GPU mode: the hand-off entry points below reach it without the registry
@@ -139,6 +151,7 @@ bool NativeGOPPresenter::offer(void *display,IOMemoryDescriptor *memory,uint64_t
         memory->retain();
         swap={true,false,++swapSequence,display,memory,nullptr,stride,width,height};
         native_gop_gpu_offers=native_gop_gpu_offers+1;
+        latencyEvent(30,swap.sequence);
         IOLockWakeup(gate,&swap,false);
     }
     IOLockUnlock(gate);return accepted;
@@ -176,6 +189,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
         IOLockUnlock(gate);OSSafeReleaseNULL(map);__atomic_fetch_add(&native_gop_gpu_failures,1,__ATOMIC_RELAXED);return kIOReturnNoMemory;
     }
     swap.map=map;
+    latencyEvent(31,swap.sequence);
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
     out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=0;
     IOLockUnlock(gate);return kIOReturnSuccess;
@@ -184,12 +198,14 @@ IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status,IOService
     IOLockLock(gate);
     if(handoffOwner!=client) {IOLockUnlock(gate);return kIOReturnNotOpen;}
     if(!swap.offered || !swap.delivered || swap.sequence!=sequence) {IOLockUnlock(gate);return kIOReturnBadArgument;}
+    latencyEvent(32,sequence);
     auto done=swap;swap={};
     IOLockUnlock(gate);
     OSSafeReleaseNULL(done.map);done.memory->release();
     if(status)__atomic_fetch_add(&native_gop_gpu_failures,1,__ATOMIC_RELAXED);
     else native_gop_gpu_completions=native_gop_gpu_completions+1;
-    native_legacy_gpu_complete(done.display,status);return kIOReturnSuccess;
+    native_legacy_gpu_complete(done.display,status);
+    latencyEvent(33,sequence);return kIOReturnSuccess;
 }
 // The client went away with a frame outstanding: the display driver is told it failed, so it can use its own path instead of waiting forever.
 bool NativeGOPPresenter::abandonSwap(IOService *client) {
