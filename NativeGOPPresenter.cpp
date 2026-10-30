@@ -9,6 +9,7 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include "NativeGOPWire.h"
+#include "NativeScanoutMap.h"
 extern "C" {
 volatile uint32_t native_gop_ready,native_gop_failures;
 volatile uint64_t native_gop_transfers,native_gop_bytes,native_gop_physical,native_gop_virtual;
@@ -29,6 +30,9 @@ class NativeGOPPresenter : public IOService {
     OSDeclareDefaultStructors(NativeGOPPresenter)
     friend class NativeGOPClient;
     IOMemoryMap *mapping=nullptr;
+    // offline-legacy-fb-wc=1 outside GPU mode: the CPU transfer stores through this private write-combined mapping. The
+    // clients' scanout memory stays the uncached provider descriptor of mapping.
+    IOMemoryMap *transferMapping=nullptr;
     IOLock *gate=nullptr;
     IOService *owner=nullptr;
     IOService *handoffOwner=nullptr;   // borrowed while this connection holds the presenter's exclusive open
@@ -95,6 +99,12 @@ bool NativeGOPPresenter::start(IOService *provider) {
        mapping->getLength()!=video.v_rowBytes*video.v_height)return false;
     gate=IOLockAlloc();if(!gate)return false;
     {unsigned v=0;PE_parse_boot_argn("sheng-fb-gpu",&v,sizeof v);gpuMode=(v==1);}
+    if(!gpuMode && native_scanout_write_combine_requested()) {
+        transferMapping=native_scanout_write_combined_map(memorySource?memorySource:provider);
+        if(transferMapping && (transferMapping->getPhysicalAddress()!=video.v_baseAddr || transferMapping->getLength()!=mapping->getLength()))
+            OSSafeReleaseNULL(transferMapping);
+        IOLog("NativeGOPPresenter: transfer mapping %s\n",transferMapping?"write-combined":"write-combined refused, uncached");
+    }
     mode={NGP_VERSION,NGP_BGRX8888,video.v_width,video.v_height,video.v_rowBytes,mapping->getLength()};
     native_gop_physical=mapping->getPhysicalAddress();native_gop_virtual=mapping->getVirtualAddress();
     online=true;native_gop_ready=1;if(gpuMode)gHandoff=this;registerService();return true;
@@ -106,7 +116,7 @@ void NativeGOPPresenter::stop(IOService *provider) {
     IOService::stop(provider);
 }
 void NativeGOPPresenter::free() {
-    OSSafeReleaseNULL(mapping);if(gate){IOLockFree(gate);gate=nullptr;}IOService::free();
+    OSSafeReleaseNULL(transferMapping);OSSafeReleaseNULL(mapping);if(gate){IOLockFree(gate);gate=nullptr;}IOService::free();
 }
 IOReturn NativeGOPPresenter::transfer(task_t task,const NGPPresent &q,NGPTransfer *result) {
     if(gpuMode)return kIOReturnUnsupported;   // in GPU mode no CPU copy exists, not even on request
@@ -118,9 +128,12 @@ IOReturn NativeGOPPresenter::transfer(task_t task,const NGPPresent &q,NGPTransfe
     if(status==kIOReturnSuccess) {
         IOLockLock(gate);
         if(!online)status=kIOReturnNotReady;
-        else if(input->readBytes(0,reinterpret_cast<void *>(mapping->getVirtualAddress()),q.bytes)!=q.bytes)status=kIOReturnUnderrun;
+        else if(input->readBytes(0,reinterpret_cast<void *>((transferMapping?transferMapping:mapping)->getVirtualAddress()),q.bytes)!=q.bytes)
+            status=kIOReturnUnderrun;
         else {
-            __asm__ volatile("dsb oshst" ::: "memory");
+            // A write-combined mapping drains its buffers with a full-system barrier before the display DMA reads the frame.
+            if(transferMapping)__asm__ volatile("dsb sy" ::: "memory");
+            else __asm__ volatile("dsb oshst" ::: "memory");
             native_gop_transfers=native_gop_transfers+1;result->sequence=native_gop_transfers;
             result->bytes=q.bytes;native_gop_bytes=native_gop_bytes+q.bytes;
         }

@@ -1,4 +1,5 @@
 #include "NativeLegacyRequest.h"
+#include "NativeScanoutMap.h"
 // SPDX-License-Identifier: BSD-2-Clause-Patent
 // Reuse the unchanged original generic framebuffer implementation. Unknown
 // backend leaves stop; this class is not yet a published system display.
@@ -55,6 +56,8 @@ static inline bool nativeBgra(uint32_t format,uint32_t planes) {
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+    // Scanout mapped write-combined (boot-arg offline-legacy-fb-wc=1); otherwise the default uncached Device mapping.
+    bool writeCombined=false;
     uint32_t scanBudget=32;
     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
     bool primary=false;
@@ -333,13 +336,20 @@ public:
         }
         if(stored==UINT64_MAX) {
             shadowValid=false;
-            if(!native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+            const bool copied=writeCombined?
+                native_legacy_copy_rows(reinterpret_cast<void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
-                source->getLength(),sourceStride,width,height)) {
+                source->getLength(),sourceStride,width,height):
+                native_legacy_copy_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),sourceStride,width,height);
+            if(!copied) {
                 OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
             }
             stored=length;
         }
+        // Full-system barrier before the swap retires: completes the Device stores, and drains the write-combining buffers of a
+        // write-combined mapping, so the display DMA (and a later GPU hand-off frame) sees every pixel of this copy.
         __asm__ volatile("dsb sy" ::: "memory");
         {uint64_t copyEnd;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyEnd));native_legacy_copy_timing_observed(copyEnd-copyStart,stored);}
         OSSafeReleaseNULL(source);transferred=true;
@@ -472,7 +482,13 @@ public:
            !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
            video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
            video.v_rowBytes>UINT64_MAX/video.v_height)return false;
-        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+        // offline-legacy-fb-wc=1: the CPU copy stores through a write-combined mapping (NativeScanoutMap.h); if that
+        // mapping cannot be made the default uncached mapping is used.
+        const bool wantCombined=native_scanout_write_combine_requested();
+        IOMemoryMap *mapping=wantCombined?native_scanout_write_combined_map(provider):nullptr;
+        const bool combined=mapping!=nullptr;
+        if(wantCombined)IOLog("NativeLegacyDisplay: scanout mapping %s\n",combined?"write-combined":"write-combined refused, uncached");
+        if(!mapping)mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
         if(!mapping)return false;
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
@@ -481,7 +497,7 @@ public:
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
             valid=width==video.v_width && height==video.v_height;
             if(valid) {
-                OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
+                OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;writeCombined=combined;
                 valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
             }
         }

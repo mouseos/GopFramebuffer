@@ -144,6 +144,26 @@ static inline int native_legacy_copy_pixels(volatile void *destination,
     return 1;
 }
 
+// Write-combined scanout only (boot-arg offline-legacy-fb-wc=1, mapped kIOMapWriteCombineCache: Normal non-cacheable on ARM).
+// Normal memory accepts the paired, wider or unaligned stores of the compiler's ordinary copy, which Device memory does not,
+// so each visible row moves with one memcpy and the stores merge in the write buffer. The Device mapping keeps
+// native_legacy_copy_pixels. The caller still issues the barrier that makes the stores visible to the display DMA.
+static inline int native_legacy_copy_rows(void *destination,
+    uint64_t destinationBytes, uint64_t destinationStride, const void *source,
+    uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height) {
+    if (!native_legacy_copy_layout(destination,destinationBytes,destinationStride,
+        source,sourceBytes,sourceStride,width,height)) return 0;
+    uintptr_t dst=(uintptr_t)destination, src=(uintptr_t)source;
+    const uint64_t row=(uint64_t)width*4;
+    if (destinationStride==row && sourceStride==row) {
+        __builtin_memcpy((void *)dst,(const void *)src,row*height);
+        return 1;
+    }
+    for (uint32_t y=0;y<height;++y)
+        __builtin_memcpy((void *)(dst+y*destinationStride),(const void *)(src+y*sourceStride),row);
+    return 1;
+}
+
 // Differential copy for the slow scanout memory: only 64-byte blocks that differ from the previous frame (kept in an ordinary
 // cached shadow buffer, rows packed at width*4) are stored to the device mapping. The shadow must start from a full copy
 // (valid=0 copies everything). Returns the number of bytes stored, or UINT64_MAX when the geometry needs the plain copy.

@@ -90,6 +90,20 @@ int main(void) {
         assert(!native_legacy_copy_pixels(target,59,20,storage,51,17,3,3));
         assert(!native_legacy_copy_pixels(target,60,20,(const void *)(UINTPTR_MAX-16),51,17,3,3));
         assert(!memcmp(before,target,sizeof(target)));
+        // The write-combined row copy stores the same pixels, leaves row padding alone and refuses the same layouts.
+        uint32_t rows[20];memset(rows,0xcc,sizeof(rows));
+        assert(native_legacy_copy_rows(rows,60,20,storage+offset,51,17,3,3));
+        assert(!memcmp(rows,before,sizeof(rows)));
+        assert(!native_legacy_copy_rows((unsigned char *)rows+1,60,20,storage,51,17,3,3));
+        assert(!native_legacy_copy_rows(rows,63,21,storage,51,17,3,3));
+        assert(!native_legacy_copy_rows(rows,60,20,storage,50,17,3,3));
+        assert(!native_legacy_copy_rows(rows,59,20,storage,51,17,3,3));
+        assert(!native_legacy_copy_rows(rows,60,20,(const void *)(UINTPTR_MAX-16),51,17,3,3));
+        assert(!memcmp(rows,before,sizeof(rows)));
+        // Packed rows on both sides take the single-copy path.
+        uint32_t packed[9];memset(packed,0xcc,sizeof(packed));
+        assert(native_legacy_copy_rows(packed,36,12,storage+offset,36,12,3,3));
+        assert(!memcmp(packed,storage+offset,36));
     }
     return 0;
 }
